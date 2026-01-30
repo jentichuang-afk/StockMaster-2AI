@@ -13,6 +13,7 @@ st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", 
 st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3.3")
 
 # --- 安全性設定 ---
+# 1. Gemini
 gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
@@ -22,6 +23,7 @@ try:
 except Exception as e:
     print(f"Gemini Init Error: {e}")
 
+# 2. Groq
 groq_ok = False
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
@@ -32,7 +34,7 @@ except:
 
 # --- 2. 側邊欄參數 ---
 st.sidebar.header("⚙️ 參數設定")
-ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330, 美股如 NVDA")
+ticker_input = st.sidebar.text_input("輸入股票代碼", value="2376", help="台股請輸入如 2330, 美股如 NVDA")
 days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
 
 if st.sidebar.button("🔄 強制刷新最新股價"):
@@ -97,17 +99,18 @@ def get_stock_fundamentals(symbol):
         stock = yf.Ticker(symbol)
         info = stock.info
         financials = stock.financials
-        return info, financials
+        # 🆕 這裡強制抓取公司官方名稱
+        stock_name = info.get('longName', symbol) 
+        return info, financials, stock_name
     except Exception as e:
-        return {}, pd.DataFrame()
+        return {}, pd.DataFrame(), symbol
 
-# --- 5. 智慧基本面修復函數 (含 PEG 手動計算) ---
+# --- 5. 智慧基本面修復函數 ---
 def get_smart_fundamentals(info, financials, current_price):
-    # 1. PE & EPS
     pe = info.get('trailingPE') or info.get('forwardPE')
     eps = info.get('trailingEps') or info.get('forwardEps')
     
-    manual_pe_val = None # 用於後續計算 PEG
+    manual_pe_val = None
     
     if pe is not None:
         pe_str = f"{pe:.2f}"
@@ -121,22 +124,17 @@ def get_smart_fundamentals(info, financials, current_price):
     else:
         pe_str = "N/A"
 
-    # 2. ROE
     roe = info.get('returnOnEquity')
     if roe is not None:
         roe_str = f"{roe*100:.2f}%"
     else:
         roe_str = "N/A"
         
-    # 3. PEG (修復重點)
     peg = info.get('pegRatio')
     if peg is not None:
         peg_str = f"{peg:.2f}"
     else:
-        # --- 啟動 PEG 手動計算模式 ---
         try:
-            # 嘗試從財報中找 EPS 欄位
-            # yfinance 的欄位名稱可能會變，這裡做簡單搜尋
             eps_row = None
             if not financials.empty:
                 for idx in financials.index:
@@ -145,14 +143,11 @@ def get_smart_fundamentals(info, financials, current_price):
                         break
             
             if eps_row is not None and len(eps_row) >= 2:
-                eps_this_year = eps_row.iloc[0] # 最近一年
-                eps_last_year = eps_row.iloc[1] # 去年
+                eps_this_year = eps_row.iloc[0]
+                eps_last_year = eps_row.iloc[1]
                 
-                # 計算成長率
                 if eps_last_year != 0:
                     growth_rate = ((eps_this_year - eps_last_year) / abs(eps_last_year)) * 100
-                    
-                    # 只有成長率 > 0 且 有 PE 才能算 PEG
                     if growth_rate > 0 and manual_pe_val is not None:
                         calc_peg = manual_pe_val / growth_rate
                         peg_str = f"{calc_peg:.2f} (估)"
@@ -169,18 +164,21 @@ def get_smart_fundamentals(info, financials, current_price):
         
     return pe_str, roe_str, eps, peg_str
 
-# --- 6. AI 分析函數 ---
-def get_prompt(symbol, pe, roe, peg, recent_data):
+# --- 6. AI 分析函數 (修正：強制傳入公司名稱) ---
+def get_prompt(symbol, stock_name, pe, roe, peg, recent_data):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
     return f"""
     角色設定：你是一位擁有 20 年經驗的華爾街「首席投資長 (CIO)」。
-    現在時間是 {now_str}。分析標的：{symbol}。
+    現在時間是 {now_str}。
+    
+    分析標的：**{stock_name}** (股票代號：{symbol})
+    ⚠️ 注意：請務必針對「{stock_name}」這家公司的產業特性與新聞進行分析，切勿混淆成其他同業。
 
     【📊 財務體質數據】
     - PE (本益比): {pe}
     - ROE (股東權益報酬率): {roe}
     - PEG (成長估值): {peg} 
-      *(註：若 PEG 顯示 (估)，代表根據歷史成長率推算，參考即可)*
 
     【📈 近五日技術數據】
     {recent_data}
@@ -189,6 +187,7 @@ def get_prompt(symbol, pe, roe, peg, recent_data):
 
     ### 1. 🕵️‍♂️ 盤勢與籌碼 (Context)
     - 解讀 **OBV** (量價配合度) 與 **MACD** 趨勢。
+    - 簡單描述該公司 ({stock_name}) 目前的市場地位或熱門題材。
 
     ### 2. 🏢 估值診斷 (Valuation)
     - **重點分析 PEG**：
@@ -242,8 +241,8 @@ if run_btn and ticker_input:
     with st.spinner(f"正在連線 Yahoo Finance 抓取股價 {symbol} ..."):
         df_raw, error_msg = get_stock_price_history(symbol, days_input)
 
-    # 這裡我們傳入 financials 給修復函數用
-    info, financials = get_stock_fundamentals(symbol)
+    # 🆕 這裡會一併抓回「公司名稱」
+    info, financials, stock_name = get_stock_fundamentals(symbol)
 
     if df_raw is None or df_raw.empty:
         st.error(f"❌ 找不到資料。錯誤訊息: {error_msg}")
@@ -253,10 +252,12 @@ if run_btn and ticker_input:
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
-        # 呼叫新的修復函數 (傳入 financials)
         pe_str, roe_str, eps_val, peg_str = get_smart_fundamentals(info, financials, last['Close'])
         last_date = last.name.strftime('%Y-%m-%d')
         
+        # 顯示公司名稱在標題，確認沒抓錯
+        st.header(f"🔥 {stock_name} ({symbol}) 即時戰情室")
+
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
         c2.metric("資料日期", f"{last_date}")
@@ -290,10 +291,11 @@ if run_btn and ticker_input:
             st.plotly_chart(fig, use_container_width=True)
 
         with tab2:
-            st.subheader(f"⚡ {symbol} 投資論戰 (Google vs Meta)")
+            st.subheader(f"⚡ {stock_name} 投資論戰 (Google vs Meta)")
             
             data_str = df.tail(5).to_string()
-            prompt = get_prompt(symbol, pe_str, roe_str, peg_str, data_str)
+            # 🆕 傳入 stock_name 給 AI，讓它看清楚是哪家公司
+            prompt = get_prompt(symbol, stock_name, pe_str, roe_str, peg_str, data_str)
             
             col_gemini, col_groq = st.columns(2)
             
