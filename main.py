@@ -10,17 +10,20 @@ from groq import Groq
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", page_icon="⚡")
-st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3")
+st.title("⚡ 股票大師：Gemini 1.5 vs Llama 3.3")
 
 # --- 安全性設定 ---
+# 1. Gemini (修正為 1.5 Flash 最新版，解決 429 額度問題)
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=gemini_key)
-    gemini_model = genai.GenerativeModel('gemini-2.0-flash') 
+    # 使用 'gemini-1.5-flash-latest' 確保抓到 Google 維護的最新穩定版
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest') 
     gemini_ok = True
 except:
     gemini_ok = False
 
+# 2. Groq (修正為 Llama 3.3，解決舊版下架問題)
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
     groq_client = Groq(api_key=groq_key)
@@ -76,18 +79,15 @@ def calculate_indicators(df):
 
     return df
 
-# --- 4. 數據抓取函數 (加入快取與除錯) ---
-@st.cache_data(ttl=3600) # 快取 1 小時，避免頻繁請求被鎖
+# --- 4. 數據抓取函數 (快取抗封鎖) ---
+@st.cache_data(ttl=3600)
 def get_stock_data(symbol, days):
     end = datetime.now()
     start = end - timedelta(days=days + 100)
     try:
-        # 下載數據
         df = yf.download(symbol, start=start, end=end, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        
-        # 簡單檢查
         if df.empty: return None, "Yahoo 回傳空資料"
         return df, None
     except Exception as e:
@@ -113,21 +113,25 @@ def get_prompt(symbol, pe, roe, peg, recent_data):
 
 def call_gemini(prompt):
     try:
+        # 使用 Google 推薦的 production 穩定版
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
+        # 如果還是 429，提示使用者
+        if "429" in str(e):
+            return "⚠️ Gemini 忙碌中 (免費額度暫滿)，請稍等 1 分鐘後再試。"
         return f"Gemini 思考失敗: {e}"
 
 def call_groq(prompt):
     try:
-        # 使用 Llama 3 70B
+        # 更新為最新的 Llama 3.3
         chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
         )
         return chat_completion.choices[0].message.content
     except Exception as e:
-        return f"Groq (Llama 3) 思考失敗: {e}"
+        return f"Groq (Llama 3.3) 思考失敗: {e}"
 
 # --- 6. 主程式 ---
 if run_btn and ticker_input:
@@ -135,10 +139,7 @@ if run_btn and ticker_input:
     if symbol.isdigit(): symbol += ".TW"
     
     with st.spinner(f"正在連線 Yahoo Finance 抓取 {symbol} ..."):
-        # 呼叫新的抓取函數
         df_raw, error_msg = get_stock_data(symbol, days_input)
-        
-        # 嘗試抓取基本面
         try:
             stock = yf.Ticker(symbol)
             info = stock.info
@@ -148,22 +149,19 @@ if run_btn and ticker_input:
             financials = pd.DataFrame()
 
     if df_raw is None or df_raw.empty:
-        st.error(f"❌ 找不到資料。可能原因：\n1. 股票代碼錯誤\n2. Yahoo Finance 暫時阻擋連線\n\n錯誤訊息: {error_msg}")
+        st.error(f"❌ 找不到資料。錯誤訊息: {error_msg}")
     else:
-        # 數據處理
         df = calculate_indicators(df_raw).iloc[-days_input:]
         last = df.iloc[-1]
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
-        # 看板
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
         c2.metric("成交量", f"{int(last['Volume']/1000)}張")
         c3.metric("PE", f"{info.get('trailingPE','N/A')}")
         c4.metric("ROE", f"{info.get('returnOnEquity',0)*100:.1f}%" if info.get('returnOnEquity') else "N/A")
 
-        # 分頁
         tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 觀點", "🏢 財報數據"])
 
         with tab1:
@@ -172,7 +170,6 @@ if run_btn and ticker_input:
             if show_obv: rows += 1
             fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=[0.5] + [0.15]*(rows-1))
             
-            # K線
             fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
             if show_ma:
                 fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='月線'), row=1, col=1)
@@ -198,7 +195,7 @@ if run_btn and ticker_input:
             col_gemini, col_groq = st.columns(2)
             
             with col_gemini:
-                st.markdown("### 🔵 Gemini 2.5 (Google)")
+                st.markdown("### 🔵 Gemini 1.5 Flash")
                 if gemini_ok:
                     with st.spinner("Gemini 深度思考中..."):
                         res_g = call_gemini(prompt)
@@ -207,9 +204,9 @@ if run_btn and ticker_input:
                     st.error("請設定 GEMINI_API_KEY")
 
             with col_groq:
-                st.markdown("### 🟠 Llama 3 (Meta/Groq)")
+                st.markdown("### 🟠 Llama 3.3 (Meta)")
                 if groq_ok:
-                    with st.spinner("Llama 3 急速運算中..."):
+                    with st.spinner("Llama 3.3 急速運算中..."):
                         res_l = call_groq(prompt)
                         st.warning(res_l) 
                 else:
