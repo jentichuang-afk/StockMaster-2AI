@@ -13,22 +13,15 @@ st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", 
 st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3.3")
 
 # --- 安全性設定 ---
-# 1. Gemini (智慧切換版)
 gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=gemini_key)
-    
-    # 策略：直接使用您清單中顯示的名稱 'gemini-flash-latest'
-    # 這通常指向目前最新的 1.5 Flash，且符合您的帳號權限
     gemini_model = genai.GenerativeModel('gemini-flash-latest') 
     gemini_ok = True
-except Exception as e:
-    # 萬一失敗，不讓程式崩潰，只是標記為 False
-    print(f"Gemini Init Error: {e}")
+except:
     gemini_ok = False
 
-# 2. Groq (Llama 3.3)
 groq_ok = False
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
@@ -85,7 +78,7 @@ def calculate_indicators(df):
 
     return df
 
-# --- 4. 數據抓取函數 (快取抗封鎖) ---
+# --- 4. 數據抓取函數 ---
 @st.cache_data(ttl=3600)
 def get_stock_data(symbol, days):
     end = datetime.now()
@@ -99,12 +92,39 @@ def get_stock_data(symbol, days):
     except Exception as e:
         return None, str(e)
 
-# --- 5. AI 分析函數 ---
+# --- 5. 🆕 智慧基本面修復函數 ---
+def get_smart_fundamentals(info, current_price):
+    # 1. 處理 PE (本益比)
+    pe = info.get('trailingPE')
+    eps = info.get('trailingEps')
+    
+    if pe is not None:
+        pe_str = f"{pe:.2f}"
+    elif eps is not None:
+        # 如果沒有 PE 但有 EPS，嘗試手動計算
+        if eps > 0:
+            manual_pe = current_price / eps
+            pe_str = f"{manual_pe:.2f} (估)"
+        else:
+            pe_str = "虧損 (EPS<0)"
+    else:
+        pe_str = "N/A"
+
+    # 2. 處理 ROE (股東權益報酬率)
+    roe = info.get('returnOnEquity')
+    if roe is not None:
+        roe_str = f"{roe*100:.2f}%"
+    else:
+        roe_str = "N/A"
+        
+    return pe_str, roe_str, eps
+
+# --- 6. AI 分析函數 ---
 def get_prompt(symbol, pe, roe, peg, recent_data):
     return f"""
     你是一位華爾街頂級避險基金經理人。請分析股票 {symbol}。
     
-    【基本面】PE: {pe}, ROE: {roe}%, PEG: {peg}
+    【基本面】PE: {pe}, ROE: {roe}, PEG: {peg}
     【技術面數據(近5日)】
     {recent_data}
     
@@ -119,38 +139,28 @@ def get_prompt(symbol, pe, roe, peg, recent_data):
 
 def call_gemini(prompt):
     try:
-        # 嘗試產生內容
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
-        error_str = str(e)
-        # 如果遇到 404 (找不到模型)，嘗試自動切換到最舊最穩的 gemini-pro
-        if "404" in error_str:
+        if "404" in str(e):
             try:
-                fallback_model = genai.GenerativeModel('gemini-pro')
-                response = fallback_model.generate_content(prompt)
-                return f"⚠️ (自動切換至標準版 Gemini) \n\n{response.text}"
-            except Exception as e2:
-                return f"Gemini 所有模型皆失敗: {e2}"
-        
-        # 如果遇到 429 (額度滿)，提示使用者
-        if "429" in error_str:
-            return "⚠️ Gemini 正在休息 (免費額度暫時用完)，請過 1 分鐘後再試。"
-            
-        return f"Gemini 思考失敗: {e}"
+                fallback = genai.GenerativeModel('gemini-pro')
+                return f"⚠️ (自動切換標準版) \n{fallback.generate_content(prompt).text}"
+            except: pass
+        if "429" in str(e): return "⚠️ Gemini 休息中 (額度滿)，請稍後再試。"
+        return f"Gemini 失敗: {e}"
 
 def call_groq(prompt):
     try:
-        # Llama 3.3
         chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
         )
         return chat_completion.choices[0].message.content
     except Exception as e:
-        return f"Groq (Llama 3.3) 思考失敗: {e}"
+        return f"Groq 失敗: {e}"
 
-# --- 6. 主程式 ---
+# --- 7. 主程式 ---
 if run_btn and ticker_input:
     symbol = ticker_input.strip().upper()
     if symbol.isdigit(): symbol += ".TW"
@@ -173,11 +183,15 @@ if run_btn and ticker_input:
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
-        c1, c2, c3, c4 = st.columns(4)
+        # 使用新的修復函數
+        pe_str, roe_str, eps_val = get_smart_fundamentals(info, last['Close'])
+        
+        c1, c2, c3, c4, c5 = st.columns(5) # 改成 5 欄，多顯示 EPS
         c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
         c2.metric("成交量", f"{int(last['Volume']/1000)}張")
-        c3.metric("PE", f"{info.get('trailingPE','N/A')}")
-        c4.metric("ROE", f"{info.get('returnOnEquity',0)*100:.1f}%" if info.get('returnOnEquity') else "N/A")
+        c3.metric("PE (本益比)", pe_str)
+        c4.metric("ROE (股東權益)", roe_str)
+        c5.metric("EPS (每股盈餘)", f"{eps_val:.2f}" if eps_val else "N/A")
 
         tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 觀點", "🏢 財報數據"])
 
@@ -207,7 +221,8 @@ if run_btn and ticker_input:
             st.subheader(f"⚡ {symbol} 投資論戰 (Google vs Meta)")
             
             data_str = df.tail(5).to_string()
-            prompt = get_prompt(symbol, info.get('trailingPE','N/A'), info.get('returnOnEquity',0)*100, info.get('pegRatio','N/A'), data_str)
+            # 傳遞修復後的數據給 AI
+            prompt = get_prompt(symbol, pe_str, roe_str, info.get('pegRatio','N/A'), data_str)
             
             col_gemini, col_groq = st.columns(2)
             
