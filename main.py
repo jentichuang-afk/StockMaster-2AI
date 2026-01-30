@@ -179,7 +179,7 @@ def get_prompt(symbol, stock_name, pe, roe, peg, recent_data):
     - ROE (股東權益報酬率): {roe}
     - PEG (成長估值): {peg} 
 
-    【📈 近五日技術數據】
+    【📈 近180日技術數據】
     {recent_data}
 
     請撰寫一份【深度投資報告】，章節如下：
@@ -342,3 +342,4 @@ if run_btn and ticker_input:
                 st.dataframe(financials)
             else:
                 st.warning("無財報資料")
+
