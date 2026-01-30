@@ -34,7 +34,7 @@ except:
 
 # --- 2. 側邊欄參數 ---
 st.sidebar.header("⚙️ 參數設定")
-ticker_input = st.sidebar.text_input("輸入股票代碼", value="2376", help="台股請輸入如 2330, 美股如 NVDA")
+ticker_input = st.sidebar.text_input("輸入股票代碼", value="8155", help="台股請輸入如 2330, 美股如 NVDA")
 days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
 
 if st.sidebar.button("🔄 強制刷新最新股價"):
@@ -88,7 +88,7 @@ def get_stock_price_history(symbol, days):
         df = yf.download(symbol, start=start, end=end, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if df.empty: return None, "Yahoo 回傳空資料"
+        if df.empty: return None, "Empty"
         return df, None
     except Exception as e:
         return None, str(e)
@@ -99,7 +99,6 @@ def get_stock_fundamentals(symbol):
         stock = yf.Ticker(symbol)
         info = stock.info
         financials = stock.financials
-        # 🆕 這裡強制抓取公司官方名稱
         stock_name = info.get('longName', symbol) 
         return info, financials, stock_name
     except Exception as e:
@@ -164,7 +163,7 @@ def get_smart_fundamentals(info, financials, current_price):
         
     return pe_str, roe_str, eps, peg_str
 
-# --- 6. AI 分析函數 (修正：強制傳入公司名稱) ---
+# --- 6. AI 分析函數 ---
 def get_prompt(symbol, stock_name, pe, roe, peg, recent_data):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
@@ -186,14 +185,12 @@ def get_prompt(symbol, stock_name, pe, roe, peg, recent_data):
     請撰寫一份【深度投資報告】，章節如下：
 
     ### 1. 🕵️‍♂️ 盤勢與籌碼 (Context)
-    - 解讀 **OBV** (量價配合度) 與 **MACD** 趨勢。
-    - 簡單描述該公司 ({stock_name}) 目前的市場地位或熱門題材。
+    - 解讀 **OBV** 與 **MACD** 趨勢。
+    - 簡單描述 {stock_name} 的市場地位。
 
     ### 2. 🏢 估值診斷 (Valuation)
-    - **重點分析 PEG**：
-      - 若 PEG < 1：是否代表市場錯殺低估？
-      - 若 PEG > 2：是否成長已被透支？
-      - 若顯示「EPS衰退」或「N/A」：請警告基本面風險。
+    - **重點分析 PEG**：(低於 1 為低估，高於 2 為高估)
+    - 結合 PE 與 ROE 判斷。
 
     ### 3. ⚔️ 劇本推演 (Scenarios)
     - **多頭劇本**：關鍵突破價。
@@ -204,7 +201,7 @@ def get_prompt(symbol, stock_name, pe, roe, peg, recent_data):
     - **進場舒適區**與**停損價**。
 
     ### 5. ⚖️ 評分 (0-100)
-    - 若 PEG 漂亮 (>0 且 <1.5) 請加分；若衰退請扣分。
+    - 請給出一個綜合評分。
     """
 
 def call_gemini(prompt):
@@ -233,20 +230,46 @@ def call_groq(prompt):
     except Exception as e:
         return f"Groq 失敗: {e}"
 
-# --- 7. 主程式 ---
+# --- 7. 主程式 (智慧上市/上櫃偵測) ---
 if run_btn and ticker_input:
-    symbol = ticker_input.strip().upper()
-    if symbol.isdigit(): symbol += ".TW"
+    raw_symbol = ticker_input.strip().upper()
     
-    with st.spinner(f"正在連線 Yahoo Finance 抓取股價 {symbol} ..."):
-        df_raw, error_msg = get_stock_price_history(symbol, days_input)
+    # 變數初始化
+    final_symbol = raw_symbol
+    df_raw = None
+    error_msg = ""
+    
+    with st.spinner(f"正在搜尋 {raw_symbol} 的正確掛牌市場 (上市.TW / 上櫃.TWO)..."):
+        # 1. 如果是數字，啟動智慧偵測
+        if raw_symbol.isdigit():
+            # 先試試看 .TW (上市)
+            try_tw = raw_symbol + ".TW"
+            df_test, err = get_stock_price_history(try_tw, days_input)
+            
+            if df_test is not None and not df_test.empty:
+                final_symbol = try_tw
+                df_raw = df_test
+            else:
+                # 失敗了？那一定是 .TWO (上櫃)
+                try_two = raw_symbol + ".TWO"
+                df_test, err = get_stock_price_history(try_two, days_input)
+                if df_test is not None and not df_test.empty:
+                    final_symbol = try_two
+                    df_raw = df_test
+                else:
+                    error_msg = "上市(.TW)與上櫃(.TWO)皆查無資料"
+        else:
+            # 美股或已帶後綴，直接查
+            final_symbol = raw_symbol
+            df_raw, error_msg = get_stock_price_history(final_symbol, days_input)
 
-    # 🆕 這裡會一併抓回「公司名稱」
-    info, financials, stock_name = get_stock_fundamentals(symbol)
-
+    # 2. 開始顯示資料
     if df_raw is None or df_raw.empty:
-        st.error(f"❌ 找不到資料。錯誤訊息: {error_msg}")
+        st.error(f"❌ 找不到 {raw_symbol} 的資料。請確認代碼是否正確。")
     else:
+        # 使用 final_symbol (正確的後綴) 去抓基本面
+        info, financials, stock_name = get_stock_fundamentals(final_symbol)
+        
         df = calculate_indicators(df_raw).iloc[-days_input:]
         last = df.iloc[-1]
         chg = last['Close'] - df['Close'].iloc[-2]
@@ -255,8 +278,8 @@ if run_btn and ticker_input:
         pe_str, roe_str, eps_val, peg_str = get_smart_fundamentals(info, financials, last['Close'])
         last_date = last.name.strftime('%Y-%m-%d')
         
-        # 顯示公司名稱在標題，確認沒抓錯
-        st.header(f"🔥 {stock_name} ({symbol}) 即時戰情室")
+        # 標題顯示正確的公司名稱與代碼
+        st.header(f"🔥 {stock_name} ({final_symbol}) 即時戰情室")
 
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
@@ -292,13 +315,10 @@ if run_btn and ticker_input:
 
         with tab2:
             st.subheader(f"⚡ {stock_name} 投資論戰 (Google vs Meta)")
-            
             data_str = df.tail(5).to_string()
-            # 🆕 傳入 stock_name 給 AI，讓它看清楚是哪家公司
-            prompt = get_prompt(symbol, stock_name, pe_str, roe_str, peg_str, data_str)
+            prompt = get_prompt(final_symbol, stock_name, pe_str, roe_str, peg_str, data_str)
             
             col_gemini, col_groq = st.columns(2)
-            
             with col_gemini:
                 st.markdown("### 🔵 Gemini (Google)")
                 if gemini_ok:
