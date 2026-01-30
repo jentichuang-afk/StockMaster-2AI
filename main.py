@@ -13,19 +13,17 @@ st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", 
 st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3.3")
 
 # --- 安全性設定 ---
-# 1. Gemini (智慧切換版)
+# 1. Gemini
 gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=gemini_key)
-    # 使用目前 Google 推薦的最新穩定版指針
     gemini_model = genai.GenerativeModel('gemini-flash-latest') 
     gemini_ok = True
 except Exception as e:
     print(f"Gemini Init Error: {e}")
-    gemini_ok = False
 
-# 2. Groq (Llama 3.3)
+# 2. Groq
 groq_ok = False
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
@@ -39,7 +37,6 @@ st.sidebar.header("⚙️ 參數設定")
 ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330, 美股如 NVDA")
 days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
 
-# 刷新按鈕 (只清除股價快取，不清除基本面，保護連線)
 if st.sidebar.button("🔄 強制刷新最新股價"):
     st.cache_data.clear()
     st.rerun()
@@ -82,9 +79,9 @@ def calculate_indicators(df):
     df['BB_Lower'] = df['MA20'] - (std * 2)
     return df
 
-# --- 4. 數據抓取函數 (分離式快取策略) ---
+# --- 4. 數據抓取函數 ---
 
-# 策略 A: 股價資料 (快取 5 分鐘，確保盤中更新)
+# 策略 A: 股價資料 (快取 5 分鐘)
 @st.cache_data(ttl=300)
 def get_stock_price_history(symbol, days):
     end = datetime.now() + timedelta(days=1) 
@@ -98,8 +95,8 @@ def get_stock_price_history(symbol, days):
     except Exception as e:
         return None, str(e)
 
-# 策略 B: 基本面資料 (快取 1 小時，避免頻繁請求被鎖)
-@st.cache_data(ttl=3600)
+# 策略 B: 基本面資料 (快取 12 小時，大幅降低 N/A 機率)
+@st.cache_data(ttl=43200)
 def get_stock_fundamentals(symbol):
     try:
         stock = yf.Ticker(symbol)
@@ -109,9 +106,9 @@ def get_stock_fundamentals(symbol):
     except Exception as e:
         return {}, pd.DataFrame()
 
-# --- 5. 智慧基本面修復函數 (新增 PEG 處理) ---
+# --- 5. 智慧基本面修復函數 ---
 def get_smart_fundamentals(info, current_price):
-    # 1. PE 本益比
+    # 嘗試多種欄位
     pe = info.get('trailingPE') or info.get('forwardPE')
     eps = info.get('trailingEps') or info.get('forwardEps')
     
@@ -126,14 +123,12 @@ def get_smart_fundamentals(info, current_price):
     else:
         pe_str = "N/A"
 
-    # 2. ROE
     roe = info.get('returnOnEquity')
     if roe is not None:
         roe_str = f"{roe*100:.2f}%"
     else:
         roe_str = "N/A"
         
-    # 3. 🆕 PEG (本益成長比)
     peg = info.get('pegRatio')
     if peg is not None:
         peg_str = f"{peg:.2f}"
@@ -142,49 +137,42 @@ def get_smart_fundamentals(info, current_price):
         
     return pe_str, roe_str, eps, peg_str
 
-# --- 6. AI 分析函數 (升級版：加入 PEG 分析邏輯) ---
+# --- 6. AI 分析函數 (容錯版 Prompt) ---
 def get_prompt(symbol, pe, roe, peg, recent_data):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
     return f"""
-    角色設定：你是一位擁有 20 年經驗的華爾街「首席投資長 (CIO)」。你的專長是結合「基本面價值」與「技術面動能」進行深度分析。
+    角色設定：你是一位擁有 20 年經驗的華爾街「首席投資長 (CIO)」。
     現在時間是 {now_str}。分析標的：{symbol}。
 
     【📊 財務體質數據】
-    - 本益比 (PE): {pe}
-    - 股東權益報酬率 (ROE): {roe} (公司賺錢效率)
-    - 🆕 PEG 指標 (本益成長比): {peg} 
-      (★重要判斷標準：PEG < 1 代表股價被低估，值得買進；PEG > 2 代表股價成長溢價過高，需小心)
+    - PE (本益比): {pe}
+    - ROE (股東權益報酬率): {roe}
+    - PEG (成長估值): {peg}
 
-    【📈 近五日技術與籌碼數據 (包含 K值, D值, MACD, OBV, 布林通道)】
+    【📈 近五日技術數據】
     {recent_data}
 
-    請撰寫一份【機構級深度投資報告】，必須包含以下五個章節，並使用繁體中文專業財經術語：
+    請撰寫一份【深度投資報告】，包含以下五章：
 
-    ### 1. 🕵️‍♂️ 盤勢與籌碼解讀 (The Context)
-    - 解讀 **OBV (能量潮)**：是「量價齊揚」(吸籌) 還是「量價背離」(出貨)？
-    - 解讀 **MACD** 與 **KD** 的多空位階。
+    ### 1. 🕵️‍♂️ 盤勢與籌碼 (Context)
+    - 解讀 **OBV** 與 **量價關係**。
+    - 判斷 **MACD** 與 **KD** 位階。
 
-    ### 2. 🏢 估值與 PEG 診斷 (Valuation)
-    - **重點分析 PEG**：目前的 PEG 數據顯示這家公司是「便宜的成長股」還是「昂貴的泡沫」？
-    - 結合 PE 與 ROE，判斷其長期持有價值。
+    ### 2. 🏢 估值診斷 (Valuation)
+    - **⚠️ 特別指令：如果上方 PE/ROE/PEG 為 "N/A"，請明確指出「目前缺乏基本面數據，僅進行技術面分析」，並跳過估值判斷，直接進入下一章。**
+    - 如果數據存在，請分析 PEG 是否 < 1 (低估) 或 > 2 (高估)。
 
-    ### 3. ⚔️ 多空劇本推演 (Scenarios)
-    - **劇本 A (多頭續攻)**：關鍵突破價位在哪？
-    - **劇本 B (回檔修正)**：關鍵支撐防線在哪？
+    ### 3. ⚔️ 劇本推演 (Scenarios)
+    - **多頭劇本**：突破哪裡確認續漲？
+    - **回檔劇本**：跌破哪裡轉弱？
 
-    ### 4. 🎯 精準操作策略 (Action Plan)
-    - **建議動作**：(積極買進 / 拉回佈局 / 區間操作 / 獲利了結 / 放空)
-    - **進場舒適區**：具體的價格區間。
-    - **停損防守價**：嚴格的風控價位。
+    ### 4. 🎯 操作策略 (Action)
+    - **建議動作**：(買進/觀望/放空)
+    - **進場舒適區**與**停損價**。
 
-    ### 5. ⚖️ 綜合風險評分 (0-100)
-    - 給出分數，並簡述理由（PEG 的高低應顯著影響評分）。
-
-    **回答要求**：
-    1. 語氣必須**冷靜、客觀、犀利**。
-    2. 如果數據中有 **N/A** 或異常值，請在分析中指出。
-    3. 特別注意 PEG 與股價的關係。
+    ### 5. ⚖️ 評分 (0-100)
+    - 如果缺乏基本面數據，請給出一個基於技術面的保守分數，並說明理由。
     """
 
 def call_gemini(prompt):
@@ -192,16 +180,15 @@ def call_gemini(prompt):
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
-        error_str = str(e)
-        if "404" in error_str:
+        if "404" in str(e):
             try:
                 fallback_model = genai.GenerativeModel('gemini-pro')
                 response = fallback_model.generate_content(prompt)
                 return f"⚠️ (自動切換至標準版 Gemini) \n\n{response.text}"
             except Exception as e2:
-                return f"Gemini 所有模型皆失敗: {e2}"
-        if "429" in error_str:
-            return "⚠️ Gemini 正在休息 (免費額度暫時用完)，請過 1 分鐘後再試。"
+                return f"Gemini 失敗: {e2}"
+        if "429" in str(e):
+            return "⚠️ Gemini 休息中 (免費額度暫時用完)，請過 1 分鐘後再試。"
         return f"Gemini 思考失敗: {e}"
 
 def call_groq(prompt):
@@ -212,7 +199,7 @@ def call_groq(prompt):
         )
         return chat_completion.choices[0].message.content
     except Exception as e:
-        return f"Groq (Llama 3.3) 思考失敗: {e}"
+        return f"Groq 失敗: {e}"
 
 # --- 7. 主程式 ---
 if run_btn and ticker_input:
@@ -234,18 +221,16 @@ if run_btn and ticker_input:
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
-        # 智慧修復基本面 (含 PEG)
         pe_str, roe_str, eps_val, peg_str = get_smart_fundamentals(info, last['Close'])
         last_date = last.name.strftime('%Y-%m-%d')
         
-        # 這裡改成 6 欄位，把 PEG 加上去
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
         c2.metric("資料日期", f"{last_date}")
-        c3.metric("PE (本益比)", pe_str)
+        c3.metric("PE", pe_str)
         c4.metric("ROE", roe_str)
         c5.metric("EPS", f"{eps_val:.2f}" if eps_val else "N/A")
-        c6.metric("PEG (成長估值)", peg_str) # 🆕 新增 PEG 看板
+        c6.metric("PEG", peg_str)
 
         tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 觀點", "🏢 財報數據"])
 
@@ -275,7 +260,7 @@ if run_btn and ticker_input:
             st.subheader(f"⚡ {symbol} 投資論戰 (Google vs Meta)")
             
             data_str = df.tail(5).to_string()
-            # 將 PEG 傳入 Prompt
+            # 將數據傳入 Prompt
             prompt = get_prompt(symbol, pe_str, roe_str, peg_str, data_str)
             
             col_gemini, col_groq = st.columns(2)
