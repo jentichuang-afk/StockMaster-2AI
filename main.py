@@ -146,7 +146,7 @@ def get_prompt(symbol, pe, roe, peg, recent_data):
     - 股東權益報酬率 (ROE): {roe} (判斷公司賺錢效率)
     - PEG 指標: {peg} (判斷成長性與估值的平衡，PEG < 1 為低估)
 
-    【📈 近五日技術與籌碼數據 (包含 K值, D值, MACD, OBV, 布林通道)】
+    【📈 近五日、30日和180日技術與籌碼數據 (包含 K值, D值, MACD, OBV, 布林通道)】
     {recent_data}
 
     請撰寫一份【機構級深度投資報告】，必須包含以下五個章節，並使用繁體中文專業財經術語：
@@ -298,3 +298,4 @@ if run_btn and ticker_input:
                 st.dataframe(financials)
             else:
                 st.warning("無財報資料")
+
