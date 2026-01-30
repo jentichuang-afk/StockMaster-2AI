@@ -1,0 +1,210 @@
+import streamlit as st
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import google.generativeai as genai
+from groq import Groq  # 改用 Groq
+
+# --- 1. 頁面設定 ---
+st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", page_icon="⚡")
+st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3")
+
+# --- 安全性設定：讀取雙金鑰 ---
+# 1. Gemini (Google)
+try:
+    gemini_key = st.secrets["GEMINI_API_KEY"]
+    genai.configure(api_key=gemini_key)
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash') 
+    gemini_ok = True
+except:
+    gemini_ok = False
+
+# 2. Groq (Meta Llama 3)
+try:
+    groq_key = st.secrets["GROQ_API_KEY"]
+    groq_client = Groq(api_key=groq_key)
+    groq_ok = True
+except:
+    groq_ok = False
+
+# --- 2. 側邊欄參數 ---
+st.sidebar.header("⚙️ 參數設定")
+ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330, 美股如 NVDA")
+days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
+
+st.sidebar.subheader("📊 技術指標開關")
+show_ma = st.sidebar.checkbox("顯示均線", value=True)
+show_macd = st.sidebar.checkbox("顯示 MACD", value=True)
+show_obv = st.sidebar.checkbox("顯示 OBV", value=True)
+
+run_btn = st.sidebar.button("🚀 啟動雙強對決", type="primary")
+
+# --- 3. 核心函數：計算指標 ---
+def calculate_indicators(df):
+    df['MA5'] = df['Close'].rolling(5).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(60).mean()
+    
+    # MACD
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp12 - exp26
+    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['Signal']
+
+    # OBV
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+
+    # KD
+    low_min = df['Low'].rolling(9).min()
+    high_max = df['High'].rolling(9).max()
+    df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
+    k_list = [50]; d_list = [50]
+    for r in df['RSV']:
+        if pd.isna(r): k_list.append(50); d_list.append(50)
+        else:
+            k = (2/3) * k_list[-1] + (1/3) * r
+            d = (2/3) * d_list[-1] + (1/3) * k
+            k_list.append(k); d_list.append(d)   
+    df['K'] = k_list[1:]; df['D'] = d_list[1:]
+    
+    # 布林
+    std = df['Close'].rolling(20).std()
+    df['BB_Upper'] = df['MA20'] + (std * 2)
+    df['BB_Lower'] = df['MA20'] - (std * 2)
+
+    return df
+
+# --- 4. AI 分析函數 ---
+def get_prompt(symbol, pe, roe, peg, recent_data):
+    return f"""
+    你是一位華爾街頂級避險基金經理人。請分析股票 {symbol}。
+    
+    【基本面】PE: {pe}, ROE: {roe}%, PEG: {peg}
+    【技術面數據(近5日)】
+    {recent_data}
+    
+    請簡潔有力地回答以下重點：
+    1. 🎯 **多空判斷**：直接說「看多」、「看空」還是「觀望」。
+    2. 🔑 **關鍵理由**：用 3 點說明為什麼（結合技術面與籌碼）。
+    3. 🛑 **操作價位**：給出建議的「進場價」與「停損價」。
+    4. 💯 **評分**：給出 0-100 分。
+    
+    請用繁體中文，語氣專業且自信。
+    """
+
+def call_gemini(prompt):
+    try:
+        response = gemini_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Gemini 思考失敗: {e}"
+
+def call_groq(prompt):
+    try:
+        # 使用 Llama 3 70B 模型 (免費且強大)
+        chat_completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama3-70b-8192",
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        return f"Groq (Llama 3) 思考失敗: {e}"
+
+# --- 5. 主程式 ---
+if run_btn and ticker_input:
+    symbol = ticker_input.strip().upper()
+    if symbol.isdigit(): symbol += ".TW"
+    
+    with st.spinner(f"正在召集 Google Gemini 與 Meta Llama 3 進行會診..."):
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=days_input + 100)
+            df_raw = yf.download(symbol, start=start, end=end, progress=False)
+            if isinstance(df_raw.columns, pd.MultiIndex):
+                df_raw.columns = df_raw.columns.get_level_values(0)
+            
+            stock = yf.Ticker(symbol)
+            info = stock.info
+            financials = stock.financials
+        except:
+            df_raw = pd.DataFrame()
+
+    if df_raw.empty:
+        st.error("❌ 找不到資料")
+    else:
+        # 數據處理
+        df = calculate_indicators(df_raw).iloc[-days_input:]
+        last = df.iloc[-1]
+        chg = last['Close'] - df['Close'].iloc[-2]
+        pct = (chg / df['Close'].iloc[-2]) * 100
+        
+        # 看板
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
+        c2.metric("成交量", f"{int(last['Volume']/1000)}張")
+        c3.metric("PE", f"{info.get('trailingPE','N/A')}")
+        c4.metric("ROE", f"{info.get('returnOnEquity',0)*100:.1f}%" if info.get('returnOnEquity') else "N/A")
+
+        # 分頁
+        tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 觀點", "🏢 財報數據"])
+
+        with tab1:
+            rows = 2
+            if show_macd: rows += 1
+            if show_obv: rows += 1
+            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=[0.5] + [0.15]*(rows-1))
+            
+            # K線
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+            if show_ma:
+                fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='月線'), row=1, col=1)
+            
+            curr_row = 2
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='量'), row=curr_row, col=1); curr_row+=1
+            
+            if show_macd:
+                colors = ['red' if h > 0 else 'green' for h in df['MACD_Hist']]
+                fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors, name='MACD'), row=curr_row, col=1); curr_row+=1
+            if show_obv:
+                fig.add_trace(go.Scatter(x=df.index, y=df['OBV'], line=dict(color='purple'), name='OBV', fill='tozeroy'), row=curr_row, col=1)
+                
+            fig.update_layout(height=800, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with tab2:
+            st.subheader(f"⚡ {symbol} 投資論戰 (Google vs Meta)")
+            
+            data_str = df.tail(5).to_string()
+            prompt = get_prompt(symbol, info.get('trailingPE','N/A'), info.get('returnOnEquity',0)*100, info.get('pegRatio','N/A'), data_str)
+            
+            col_gemini, col_groq = st.columns(2)
+            
+            with col_gemini:
+                st.markdown("### 🔵 Gemini 2.5 (Google)")
+                if gemini_ok:
+                    with st.spinner("Gemini 深度思考中..."):
+                        res_g = call_gemini(prompt)
+                        st.info(res_g)
+                else:
+                    st.error("請設定 GEMINI_API_KEY")
+
+            with col_groq:
+                st.markdown("### 🟠 Llama 3 (Meta/Groq)")
+                if groq_ok:
+                    with st.spinner("Llama 3 急速運算中..."):
+                        # 這裡使用 Groq 呼叫 Llama 3
+                        res_l = call_groq(prompt)
+                        st.warning(res_l) # 使用不同顏色區分
+                else:
+                    st.error("請設定 GROQ_API_KEY")
+                    st.markdown("*(Groq 目前免費，請去申請)*")
+
+        with tab3:
+            if not financials.empty:
+                st.dataframe(financials)
+            else:
+                st.warning("無財報資料")
