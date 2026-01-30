@@ -13,7 +13,6 @@ st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", 
 st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3.3")
 
 # --- 安全性設定 ---
-# 1. Gemini
 gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
@@ -23,7 +22,6 @@ try:
 except Exception as e:
     print(f"Gemini Init Error: {e}")
 
-# 2. Groq
 groq_ok = False
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
@@ -80,8 +78,6 @@ def calculate_indicators(df):
     return df
 
 # --- 4. 數據抓取函數 ---
-
-# 策略 A: 股價資料 (快取 5 分鐘)
 @st.cache_data(ttl=300)
 def get_stock_price_history(symbol, days):
     end = datetime.now() + timedelta(days=1) 
@@ -95,7 +91,6 @@ def get_stock_price_history(symbol, days):
     except Exception as e:
         return None, str(e)
 
-# 策略 B: 基本面資料 (快取 12 小時，大幅降低 N/A 機率)
 @st.cache_data(ttl=43200)
 def get_stock_fundamentals(symbol):
     try:
@@ -106,41 +101,77 @@ def get_stock_fundamentals(symbol):
     except Exception as e:
         return {}, pd.DataFrame()
 
-# --- 5. 智慧基本面修復函數 ---
-def get_smart_fundamentals(info, current_price):
-    # 嘗試多種欄位
+# --- 5. 智慧基本面修復函數 (含 PEG 手動計算) ---
+def get_smart_fundamentals(info, financials, current_price):
+    # 1. PE & EPS
     pe = info.get('trailingPE') or info.get('forwardPE')
     eps = info.get('trailingEps') or info.get('forwardEps')
     
+    manual_pe_val = None # 用於後續計算 PEG
+    
     if pe is not None:
         pe_str = f"{pe:.2f}"
+        manual_pe_val = pe
     elif eps is not None:
         if eps > 0:
-            manual_pe = current_price / eps
-            pe_str = f"{manual_pe:.2f} (估)"
+            manual_pe_val = current_price / eps
+            pe_str = f"{manual_pe_val:.2f} (估)"
         else:
             pe_str = "虧損 (EPS<0)"
     else:
         pe_str = "N/A"
 
+    # 2. ROE
     roe = info.get('returnOnEquity')
     if roe is not None:
         roe_str = f"{roe*100:.2f}%"
     else:
         roe_str = "N/A"
         
+    # 3. PEG (修復重點)
     peg = info.get('pegRatio')
     if peg is not None:
         peg_str = f"{peg:.2f}"
     else:
-        peg_str = "N/A"
+        # --- 啟動 PEG 手動計算模式 ---
+        try:
+            # 嘗試從財報中找 EPS 欄位
+            # yfinance 的欄位名稱可能會變，這裡做簡單搜尋
+            eps_row = None
+            if not financials.empty:
+                for idx in financials.index:
+                    if 'Basic EPS' in str(idx) or 'Diluted EPS' in str(idx):
+                        eps_row = financials.loc[idx]
+                        break
+            
+            if eps_row is not None and len(eps_row) >= 2:
+                eps_this_year = eps_row.iloc[0] # 最近一年
+                eps_last_year = eps_row.iloc[1] # 去年
+                
+                # 計算成長率
+                if eps_last_year != 0:
+                    growth_rate = ((eps_this_year - eps_last_year) / abs(eps_last_year)) * 100
+                    
+                    # 只有成長率 > 0 且 有 PE 才能算 PEG
+                    if growth_rate > 0 and manual_pe_val is not None:
+                        calc_peg = manual_pe_val / growth_rate
+                        peg_str = f"{calc_peg:.2f} (估)"
+                    elif growth_rate <= 0:
+                        peg_str = "N/A (EPS衰退)"
+                    else:
+                        peg_str = "N/A"
+                else:
+                    peg_str = "N/A"
+            else:
+                peg_str = "N/A"
+        except Exception as e:
+            peg_str = "N/A"
         
     return pe_str, roe_str, eps, peg_str
 
-# --- 6. AI 分析函數 (容錯版 Prompt) ---
+# --- 6. AI 分析函數 ---
 def get_prompt(symbol, pe, roe, peg, recent_data):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
     return f"""
     角色設定：你是一位擁有 20 年經驗的華爾街「首席投資長 (CIO)」。
     現在時間是 {now_str}。分析標的：{symbol}。
@@ -148,31 +179,33 @@ def get_prompt(symbol, pe, roe, peg, recent_data):
     【📊 財務體質數據】
     - PE (本益比): {pe}
     - ROE (股東權益報酬率): {roe}
-    - PEG (成長估值): {peg}
+    - PEG (成長估值): {peg} 
+      *(註：若 PEG 顯示 (估)，代表根據歷史成長率推算，參考即可)*
 
     【📈 近五日技術數據】
     {recent_data}
 
-    請撰寫一份【深度投資報告】，包含以下五章：
+    請撰寫一份【深度投資報告】，章節如下：
 
     ### 1. 🕵️‍♂️ 盤勢與籌碼 (Context)
-    - 解讀 **OBV** 與 **量價關係**。
-    - 判斷 **MACD** 與 **KD** 位階。
+    - 解讀 **OBV** (量價配合度) 與 **MACD** 趨勢。
 
     ### 2. 🏢 估值診斷 (Valuation)
-    - **⚠️ 特別指令：如果上方 PE/ROE/PEG 為 "N/A"，請明確指出「目前缺乏基本面數據，僅進行技術面分析」，並跳過估值判斷，直接進入下一章。**
-    - 如果數據存在，請分析 PEG 是否 < 1 (低估) 或 > 2 (高估)。
+    - **重點分析 PEG**：
+      - 若 PEG < 1：是否代表市場錯殺低估？
+      - 若 PEG > 2：是否成長已被透支？
+      - 若顯示「EPS衰退」或「N/A」：請警告基本面風險。
 
     ### 3. ⚔️ 劇本推演 (Scenarios)
-    - **多頭劇本**：突破哪裡確認續漲？
-    - **回檔劇本**：跌破哪裡轉弱？
+    - **多頭劇本**：關鍵突破價。
+    - **回檔劇本**：關鍵支撐價。
 
     ### 4. 🎯 操作策略 (Action)
-    - **建議動作**：(買進/觀望/放空)
+    - **建議**：(買進/觀望/賣出)
     - **進場舒適區**與**停損價**。
 
     ### 5. ⚖️ 評分 (0-100)
-    - 如果缺乏基本面數據，請給出一個基於技術面的保守分數，並說明理由。
+    - 若 PEG 漂亮 (>0 且 <1.5) 請加分；若衰退請扣分。
     """
 
 def call_gemini(prompt):
@@ -206,11 +239,10 @@ if run_btn and ticker_input:
     symbol = ticker_input.strip().upper()
     if symbol.isdigit(): symbol += ".TW"
     
-    # 步驟 1: 抓股價
     with st.spinner(f"正在連線 Yahoo Finance 抓取股價 {symbol} ..."):
         df_raw, error_msg = get_stock_price_history(symbol, days_input)
 
-    # 步驟 2: 抓基本面
+    # 這裡我們傳入 financials 給修復函數用
     info, financials = get_stock_fundamentals(symbol)
 
     if df_raw is None or df_raw.empty:
@@ -221,7 +253,8 @@ if run_btn and ticker_input:
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
-        pe_str, roe_str, eps_val, peg_str = get_smart_fundamentals(info, last['Close'])
+        # 呼叫新的修復函數 (傳入 financials)
+        pe_str, roe_str, eps_val, peg_str = get_smart_fundamentals(info, financials, last['Close'])
         last_date = last.name.strftime('%Y-%m-%d')
         
         c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -260,7 +293,6 @@ if run_btn and ticker_input:
             st.subheader(f"⚡ {symbol} 投資論戰 (Google vs Meta)")
             
             data_str = df.tail(5).to_string()
-            # 將數據傳入 Prompt
             prompt = get_prompt(symbol, pe_str, roe_str, peg_str, data_str)
             
             col_gemini, col_groq = st.columns(2)
