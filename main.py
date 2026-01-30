@@ -232,4 +232,74 @@ if run_btn and ticker_input:
         df = calculate_indicators(df_raw).iloc[-days_input:]
         last = df.iloc[-1]
         chg = last['Close'] - df['Close'].iloc[-2]
-        pct = (chg / df['
+        pct = (chg / df['Close'].iloc[-2]) * 100
+        
+        # 智慧修復基本面 (含 PEG)
+        pe_str, roe_str, eps_val, peg_str = get_smart_fundamentals(info, last['Close'])
+        last_date = last.name.strftime('%Y-%m-%d')
+        
+        # 這裡改成 6 欄位，把 PEG 加上去
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
+        c2.metric("資料日期", f"{last_date}")
+        c3.metric("PE (本益比)", pe_str)
+        c4.metric("ROE", roe_str)
+        c5.metric("EPS", f"{eps_val:.2f}" if eps_val else "N/A")
+        c6.metric("PEG (成長估值)", peg_str) # 🆕 新增 PEG 看板
+
+        tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 觀點", "🏢 財報數據"])
+
+        with tab1:
+            rows = 2
+            if show_macd: rows += 1
+            if show_obv: rows += 1
+            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=[0.5] + [0.15]*(rows-1))
+            
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+            if show_ma:
+                fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='月線'), row=1, col=1)
+            
+            curr_row = 2
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='量'), row=curr_row, col=1); curr_row+=1
+            
+            if show_macd:
+                colors = ['red' if h > 0 else 'green' for h in df['MACD_Hist']]
+                fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors, name='MACD'), row=curr_row, col=1); curr_row+=1
+            if show_obv:
+                fig.add_trace(go.Scatter(x=df.index, y=df['OBV'], line=dict(color='purple'), name='OBV', fill='tozeroy'), row=curr_row, col=1)
+                
+            fig.update_layout(height=800, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with tab2:
+            st.subheader(f"⚡ {symbol} 投資論戰 (Google vs Meta)")
+            
+            data_str = df.tail(5).to_string()
+            # 將 PEG 傳入 Prompt
+            prompt = get_prompt(symbol, pe_str, roe_str, peg_str, data_str)
+            
+            col_gemini, col_groq = st.columns(2)
+            
+            with col_gemini:
+                st.markdown("### 🔵 Gemini (Google)")
+                if gemini_ok:
+                    with st.spinner("Gemini 首席分析師思考中..."):
+                        res_g = call_gemini(prompt)
+                        st.info(res_g)
+                else:
+                    st.error("請設定 GEMINI_API_KEY")
+
+            with col_groq:
+                st.markdown("### 🟠 Llama 3.3 (Meta)")
+                if groq_ok:
+                    with st.spinner("Llama 3.3 首席分析師運算中..."):
+                        res_l = call_groq(prompt)
+                        st.warning(res_l) 
+                else:
+                    st.error("請設定 GROQ_API_KEY")
+
+        with tab3:
+            if not financials.empty:
+                st.dataframe(financials)
+            else:
+                st.warning("無財報資料")
