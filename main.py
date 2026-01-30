@@ -35,10 +35,10 @@ st.sidebar.header("⚙️ 參數設定")
 ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330, 美股如 NVDA")
 days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
 
-# 🆕 新增：強制刷新按鈕
+# 刷新按鈕 (只清除股價快取，不清除基本面，保護連線)
 if st.sidebar.button("🔄 強制刷新最新股價"):
-    st.cache_data.clear() # 清除所有快取
-    st.rerun() # 重新執行網頁
+    st.cache_data.clear()
+    st.rerun()
 
 st.sidebar.subheader("📊 技術指標開關")
 show_ma = st.sidebar.checkbox("顯示均線", value=True)
@@ -53,17 +53,14 @@ def calculate_indicators(df):
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA60'] = df['Close'].rolling(60).mean()
     
-    # MACD
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = exp12 - exp26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['Signal']
 
-    # OBV
     df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
 
-    # KD
     low_min = df['Low'].rolling(9).min()
     high_max = df['High'].rolling(9).max()
     df['RSV'] = (df['Close'] - low_min) / (high_max - low_min) * 100
@@ -76,19 +73,16 @@ def calculate_indicators(df):
             k_list.append(k); d_list.append(d)   
     df['K'] = k_list[1:]; df['D'] = d_list[1:]
     
-    # 布林
     std = df['Close'].rolling(20).std()
     df['BB_Upper'] = df['MA20'] + (std * 2)
     df['BB_Lower'] = df['MA20'] - (std * 2)
-
     return df
 
-# --- 4. 數據抓取函數 (已優化時間與快取) ---
-# 🆕 修改：快取時間縮短為 300秒 (5分鐘)，盤中比較準
+# --- 4. 數據抓取函數 (分離式快取策略) ---
+
+# 策略 A: 股價資料 (快取 5 分鐘，確保盤中更新)
 @st.cache_data(ttl=300)
-def get_stock_data(symbol, days):
-    # 🆕 修改：end 日期往後推 1 天，確保包含「今天」
-    # 因為 yfinance 的 end 是 "不包含"，所以要 +1 天才抓得到今天的盤中資料
+def get_stock_price_history(symbol, days):
     end = datetime.now() + timedelta(days=1) 
     start = end - timedelta(days=days + 100)
     try:
@@ -100,10 +94,23 @@ def get_stock_data(symbol, days):
     except Exception as e:
         return None, str(e)
 
+# 策略 B: 基本面資料 (快取 1 小時，避免頻繁請求被鎖)
+@st.cache_data(ttl=3600)
+def get_stock_fundamentals(symbol):
+    try:
+        stock = yf.Ticker(symbol)
+        # 強制抓取 info，若失敗回傳空字典
+        info = stock.info
+        financials = stock.financials
+        return info, financials
+    except Exception as e:
+        return {}, pd.DataFrame()
+
 # --- 5. 智慧基本面修復函數 ---
 def get_smart_fundamentals(info, current_price):
-    pe = info.get('trailingPE')
-    eps = info.get('trailingEps')
+    # 嘗試多種欄位名稱 (Yahoo有時候會改名)
+    pe = info.get('trailingPE') or info.get('forwardPE')
+    eps = info.get('trailingEps') or info.get('forwardEps')
     
     if pe is not None:
         pe_str = f"{pe:.2f}"
@@ -126,15 +133,13 @@ def get_smart_fundamentals(info, current_price):
 
 # --- 6. AI 分析函數 ---
 def get_prompt(symbol, pe, roe, peg, recent_data):
-    # 取得現在時間 (字串)，讓 AI 知道這是盤中還是盤後
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
     return f"""
     你是一位華爾街頂級避險基金經理人。現在時間是 {now_str}。
     請分析股票 {symbol}。
     
     【基本面】PE: {pe}, ROE: {roe}, PEG: {peg}
-    【技術面數據(最新5筆，若最後一筆日期為今日則為盤中數據)】
+    【技術面數據(最新5筆)】
     {recent_data}
     
     請簡潔有力地回答以下重點：
@@ -174,15 +179,12 @@ if run_btn and ticker_input:
     symbol = ticker_input.strip().upper()
     if symbol.isdigit(): symbol += ".TW"
     
-    with st.spinner(f"正在連線 Yahoo Finance 抓取 {symbol} ..."):
-        df_raw, error_msg = get_stock_data(symbol, days_input)
-        try:
-            stock = yf.Ticker(symbol)
-            info = stock.info
-            financials = stock.financials
-        except:
-            info = {}
-            financials = pd.DataFrame()
+    # 步驟 1: 抓股價 (快)
+    with st.spinner(f"正在連線 Yahoo Finance 抓取股價 {symbol} ..."):
+        df_raw, error_msg = get_stock_price_history(symbol, days_input)
+
+    # 步驟 2: 抓基本面 (慢，但有快取保護)
+    info, financials = get_stock_fundamentals(symbol)
 
     if df_raw is None or df_raw.empty:
         st.error(f"❌ 找不到資料。錯誤訊息: {error_msg}")
@@ -192,14 +194,13 @@ if run_btn and ticker_input:
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
+        # 智慧修復基本面
         pe_str, roe_str, eps_val = get_smart_fundamentals(info, last['Close'])
-        
-        # 顯示最後更新日期，讓使用者確認
         last_date = last.name.strftime('%Y-%m-%d')
         
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
-        c2.metric("資料日期", f"{last_date}") # 🆕 顯示資料日期
+        c2.metric("資料日期", f"{last_date}")
         c3.metric("PE (本益比)", pe_str)
         c4.metric("ROE (股東權益)", roe_str)
         c5.metric("EPS (每股盈餘)", f"{eps_val:.2f}" if eps_val else "N/A")
