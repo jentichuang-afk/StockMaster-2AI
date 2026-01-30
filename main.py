@@ -131,49 +131,51 @@ def get_smart_fundamentals(info, current_price):
         
     return pe_str, roe_str, eps
 
-# --- 6. AI 分析函數 ---
+# --- 6. AI 分析函數 (升級版：法人思維鏈) ---
 def get_prompt(symbol, pe, roe, peg, recent_data):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
     return f"""
-    你是一位華爾街頂級避險基金經理人。現在時間是 {now_str}。
-    請分析股票 {symbol}。
-    
-    【基本面】PE: {pe}, ROE: {roe}, PEG: {peg}
-    【技術面數據(最新5筆)】
+    角色設定：你是一位擁有 20 年經驗的華爾街「首席投資長 (CIO)」。你的專長是結合「基本面價值」與「技術面動能」進行深度分析。
+    現在時間是 {now_str}。分析標的：{symbol}。
+
+    【📊 財務體質數據】
+    - 本益比 (PE): {pe} (判斷估值水位)
+    - 股東權益報酬率 (ROE): {roe} (判斷公司賺錢效率)
+    - PEG 指標: {peg} (判斷成長性與估值的平衡，PEG < 1 為低估)
+
+    【📈 近五日技術與籌碼數據 (包含 K值, D值, MACD, OBV, 布林通道)】
     {recent_data}
-    
-    請簡潔有力地回答以下重點：
-    1. 🎯 **多空判斷**：直接說「看多」、「看空」還是「觀望」。
-    2. 🔑 **關鍵理由**：用 3 點說明為什麼（結合技術面與籌碼）。
-    3. 🛑 **操作價位**：給出建議的「進場價」與「停損價」。
-    4. 💯 **評分**：給出 0-100 分。
-    
-    請用繁體中文，語氣專業且自信。
+
+    請撰寫一份【機構級深度投資報告】，必須包含以下五個章節，並使用繁體中文專業財經術語：
+
+    ### 1. 🕵️‍♂️ 盤勢與籌碼解讀 (The Context)
+    - 不要只看漲跌，請解讀 **OBV (能量潮)** 與股價的關係。是「量價齊揚」(健康)、還是「量價背離」(危險)？
+    - 觀察 **MACD 柱狀體** 的變化，判斷目前是由多方控盤還是空方抵抗？
+    - **KD 指標** 目前是處於低檔黃金交叉(買點)？還是高檔鈍化/死亡交叉(賣點)？
+
+    ### 2. 🏢 估值與體質診斷 (Valuation)
+    - 根據 PE 與 ROE，這家公司是「績優成長股」還是「投機轉機股」？
+    - PEG 顯示目前的股價是便宜、合理還是過熱？
+
+    ### 3. ⚔️ 多空劇本推演 (Scenarios)
+    - **劇本 A (多頭續攻)**：如果股價突破什麼關鍵價位，確認漲勢延續？
+    - **劇本 B (回檔修正)**：如果跌破哪條均線或支撐，代表趨勢轉弱？
+
+    ### 4. 🎯 精準操作策略 (Action Plan)
+    - **建議動作**：(積極買進 / 拉回佈局 / 區間操作 / 反彈減碼 / 放空)
+    - **進場舒適區**：具體的價格區間。
+    - **停利目標價**：根據布林上軌或前高推算的目標。
+    - **停損防守價**：嚴格的風控價位。
+
+    ### 5. ⚖️ 綜合風險評分 (0-100)
+    - 給出分數，並簡述理由（例如：基本面雖好但技術面過熱，扣分）。
+
+    **回答要求**：
+    1. 語氣必須**冷靜、客觀、犀利**，不要模稜兩可。
+    2. 如果數據中有 **N/A** 或異常值，請在分析中指出並提醒風險。
+    3. 遇到「技術指標背離」或「乖離率過大」時，必須發出警告。
     """
-
-def call_gemini(prompt):
-    try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        if "404" in str(e):
-            try:
-                fallback = genai.GenerativeModel('gemini-pro')
-                return f"⚠️ (自動切換標準版) \n{fallback.generate_content(prompt).text}"
-            except: pass
-        if "429" in str(e): return "⚠️ Gemini 休息中 (額度滿)，請稍後再試。"
-        return f"Gemini 失敗: {e}"
-
-def call_groq(prompt):
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-        )
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        return f"Groq 失敗: {e}"
-
 # --- 7. 主程式 ---
 if run_btn and ticker_input:
     symbol = ticker_input.strip().upper()
@@ -260,3 +262,4 @@ if run_btn and ticker_input:
                 st.dataframe(financials)
             else:
                 st.warning("無財報資料")
+
