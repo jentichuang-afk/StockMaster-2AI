@@ -10,20 +10,26 @@ from groq import Groq
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="股票大師：雙 AI 戰情室", layout="wide", page_icon="⚡")
-st.title("⚡ 股票大師：Gemini 1.5 vs Llama 3.3")
+st.title("⚡ 股票大師：Google Gemini vs Meta Llama 3.3")
 
 # --- 安全性設定 ---
-# 1. Gemini (修正為 1.5 Flash 最新版，解決 429 額度問題)
+# 1. Gemini (智慧切換版)
+gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=gemini_key)
-    # 使用 'gemini-1.5-flash-latest' 確保抓到 Google 維護的最新穩定版
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest') 
+    
+    # 策略：直接使用您清單中顯示的名稱 'gemini-flash-latest'
+    # 這通常指向目前最新的 1.5 Flash，且符合您的帳號權限
+    gemini_model = genai.GenerativeModel('gemini-flash-latest') 
     gemini_ok = True
-except:
+except Exception as e:
+    # 萬一失敗，不讓程式崩潰，只是標記為 False
+    print(f"Gemini Init Error: {e}")
     gemini_ok = False
 
-# 2. Groq (修正為 Llama 3.3，解決舊版下架問題)
+# 2. Groq (Llama 3.3)
+groq_ok = False
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
     groq_client = Groq(api_key=groq_key)
@@ -113,18 +119,29 @@ def get_prompt(symbol, pe, roe, peg, recent_data):
 
 def call_gemini(prompt):
     try:
-        # 使用 Google 推薦的 production 穩定版
+        # 嘗試產生內容
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
-        # 如果還是 429，提示使用者
-        if "429" in str(e):
-            return "⚠️ Gemini 忙碌中 (免費額度暫滿)，請稍等 1 分鐘後再試。"
+        error_str = str(e)
+        # 如果遇到 404 (找不到模型)，嘗試自動切換到最舊最穩的 gemini-pro
+        if "404" in error_str:
+            try:
+                fallback_model = genai.GenerativeModel('gemini-pro')
+                response = fallback_model.generate_content(prompt)
+                return f"⚠️ (自動切換至標準版 Gemini) \n\n{response.text}"
+            except Exception as e2:
+                return f"Gemini 所有模型皆失敗: {e2}"
+        
+        # 如果遇到 429 (額度滿)，提示使用者
+        if "429" in error_str:
+            return "⚠️ Gemini 正在休息 (免費額度暫時用完)，請過 1 分鐘後再試。"
+            
         return f"Gemini 思考失敗: {e}"
 
 def call_groq(prompt):
     try:
-        # 更新為最新的 Llama 3.3
+        # Llama 3.3
         chat_completion = groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
@@ -195,7 +212,7 @@ if run_btn and ticker_input:
             col_gemini, col_groq = st.columns(2)
             
             with col_gemini:
-                st.markdown("### 🔵 Gemini 1.5 Flash")
+                st.markdown("### 🔵 Gemini (Google)")
                 if gemini_ok:
                     with st.spinner("Gemini 深度思考中..."):
                         res_g = call_gemini(prompt)
