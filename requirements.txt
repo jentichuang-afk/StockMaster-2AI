@@ -1,0 +1,7 @@
+streamlit
+yfinance
+plotly
+pandas
+numpy
+google-generativeai>=0.7.0
+groq  <-- 改成這個
