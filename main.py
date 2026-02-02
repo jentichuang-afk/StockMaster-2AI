@@ -7,6 +7,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import google.generativeai as genai
 from groq import Groq
+import requests # 🆕 引入 requests 來做偽裝
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="股票大師：全方位戰情室", layout="wide", page_icon="⚡")
@@ -18,7 +19,7 @@ gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=gemini_key)
-    # 使用您確認可用的模型
+    # 使用您確認可用的 gemini-flash-latest
     gemini_model = genai.GenerativeModel('gemini-flash-latest') 
     gemini_ok = True
 except Exception as e:
@@ -38,7 +39,6 @@ st.sidebar.header("⚙️ 參數設定")
 ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330 (上市) 或 8155 (上櫃)")
 days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
 
-# 強制刷新按鈕
 if st.sidebar.button("🔄 強制刷新最新股價"):
     st.cache_data.clear()
     st.rerun()
@@ -81,33 +81,41 @@ def calculate_indicators(df):
     df['BB_Lower'] = df['MA20'] - (std * 2)
     return df
 
-# --- 4. 數據抓取函數 (強化連線版) ---
+# --- 4. 數據抓取函數 (含偽裝機制) ---
+
+# 建立偽裝 Session
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    return session
+
 @st.cache_data(ttl=300)
 def get_stock_price_history(symbol, days):
     end = datetime.now() + timedelta(days=1) 
     start = end - timedelta(days=days + 100)
     try:
-        # 🛡️ 加入 User-Agent 偽裝成瀏覽器，避免被 Yahoo 擋擋
-        # 注意：yfinance 新版通常會自動處理，但顯式加上更保險
+        # 使用 yfinance 內建機制
         df = yf.download(symbol, start=start, end=end, progress=False)
-        
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-            
         if df.empty: return None, "Empty"
         return df, None
     except Exception as e:
         return None, str(e)
 
-@st.cache_data(ttl=43200)
+@st.cache_data(ttl=43200) # 財報快取 12 小時
 def get_stock_fundamentals(symbol):
     try:
-        stock = yf.Ticker(symbol)
+        # 🎭 關鍵修改：傳入 session 做偽裝，騙過 Yahoo
+        session = get_session()
+        stock = yf.Ticker(symbol, session=session)
+        
         info = stock.info
         financials = stock.financials
         stock_name = info.get('longName', symbol)
         
-        # 抓新聞
         try:
             news_list = stock.news[:5] if stock.news else []
             news_data = []
@@ -195,7 +203,7 @@ def get_prompt(symbol, stock_name, pe, roe, peg, rev_growth, recent_data, news_t
     現在時間是 {now_str}。
     
     分析標的：**{stock_name}** (股票代號：{symbol})
-    ⚠️ 注意：請針對「{stock_name}」這家公司進行分析。
+    ⚠️ 注意：請針對「{stock_name}」這家公司進行分析，切勿混淆。
     
     【📰 近期頭條新聞 (Sentiment Data)】
     {news_text}
@@ -218,6 +226,7 @@ def get_prompt(symbol, stock_name, pe, roe, peg, rev_growth, recent_data, news_t
     ### 2. 💰 財報重點摘要 (Financials)
     - 列出 **3 個投資亮點或風險提示**。
     - 若數據顯示衰退，請發出警語。
+    - 若數據為 N/A，請提醒使用者目前無法取得最新財報，僅以技術面分析。
 
     ### 3. 🕵️‍♂️ 盤勢與籌碼 (Context)
     - 解讀 **OBV** 與 **MACD**。
@@ -264,7 +273,6 @@ if run_btn and ticker_input:
     error_msg = ""
     
     with st.spinner(f"正在搜尋 {raw_symbol} 並進行全方位掃描..."):
-        # 1. 嘗試上市 (.TW)
         if raw_symbol.isdigit():
             try_tw = raw_symbol + ".TW"
             df_test, err = get_stock_price_history(try_tw, days_input)
@@ -273,14 +281,13 @@ if run_btn and ticker_input:
                 final_symbol = try_tw
                 df_raw = df_test
             else:
-                # 2. 嘗試上櫃 (.TWO)
                 try_two = raw_symbol + ".TWO"
                 df_test, err = get_stock_price_history(try_two, days_input)
                 if df_test is not None and not df_test.empty:
                     final_symbol = try_two
                     df_raw = df_test
                 else:
-                    error_msg = "上市(.TW)與上櫃(.TWO)皆查無資料 (可能被 Yahoo 暫時阻擋，請稍後再試)"
+                    error_msg = "上市(.TW)與上櫃(.TWO)皆查無資料"
         else:
             final_symbol = raw_symbol
             df_raw, error_msg = get_stock_price_history(final_symbol, days_input)
@@ -339,7 +346,7 @@ if run_btn and ticker_input:
                 st.markdown(news_text)
 
             data_str = df.tail(5).to_string()
-            # 🐞 這裡已經修復：將 symbol 改為 final_symbol
+            # 🐞 變數名稱修復：使用 final_symbol
             prompt = get_prompt(final_symbol, stock_name, pe_str, roe_str, peg_str, rev_str, data_str, news_text)
             
             col_gemini, col_groq = st.columns(2)
