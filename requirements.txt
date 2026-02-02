@@ -5,3 +5,5 @@ pandas
 numpy
 google-generativeai>=0.7.0
 groq
+requests
+gnews 
