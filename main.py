@@ -8,38 +8,36 @@ from datetime import datetime, timedelta
 import google.generativeai as genai
 from groq import Groq
 import requests
-from gnews import GNews # 🆕 引入 Google News 套件
+from gnews import GNews
 
 # --- 1. 頁面設定 ---
 st.set_page_config(page_title="股票大師：全方位戰情室", layout="wide", page_icon="⚡")
 st.title("⚡ 股票大師：技術 x 財報 x Google 新聞")
 
 # --- 安全性設定 ---
-# 1. Gemini
 gemini_ok = False
 try:
     gemini_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=gemini_key)
     gemini_model = genai.GenerativeModel('gemini-flash-latest') 
     gemini_ok = True
-except Exception as e:
-    print(f"Gemini Init Error: {e}")
+except:
+    pass
 
-# 2. Groq
 groq_ok = False
 try:
     groq_key = st.secrets["GROQ_API_KEY"]
     groq_client = Groq(api_key=groq_key)
     groq_ok = True
 except:
-    groq_ok = False
+    pass
 
 # --- 2. 側邊欄參數 ---
 st.sidebar.header("⚙️ 參數設定")
-ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330 (上市) 或 8155 (上櫃)")
+ticker_input = st.sidebar.text_input("輸入股票代碼", value="2330", help="台股請輸入如 2330, 美股如 NVDA")
 days_input = st.sidebar.slider("K線觀察天數", 60, 730, 180)
 
-if st.sidebar.button("🔄 強制刷新最新股價"):
+if st.sidebar.button("🔄 強制刷新"):
     st.cache_data.clear()
     st.rerun()
 
@@ -52,6 +50,10 @@ run_btn = st.sidebar.button("🚀 啟動全方位分析", type="primary")
 
 # --- 3. 核心函數：計算指標 ---
 def calculate_indicators(df):
+    # 確保資料是數值型態
+    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
+    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce')
+    
     df['MA5'] = df['Close'].rolling(5).mean()
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA60'] = df['Close'].rolling(60).mean()
@@ -81,215 +83,166 @@ def calculate_indicators(df):
     df['BB_Lower'] = df['MA20'] - (std * 2)
     return df
 
-# --- 4. 數據抓取函數 ---
-def get_session():
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    return session
+# --- 4. 數據抓取函數 (極致偽裝版) ---
 
+# 4.1 新聞抓取 (Google News)
+def fetch_google_news(query_name):
+    try:
+        google_news = GNews(language='zh-Hant', country='TW', period='7d', max_results=5)
+        news_json = google_news.get_news(query_name)
+        news_data = []
+        for n in news_json:
+            title = n.get('title', '無標題')
+            publisher = n.get('publisher', {}).get('title', 'Google News')
+            url = n.get('url', '#')
+            news_data.append(f"- [{title}]({url}) ({publisher})")
+        return "\n".join(news_data) if news_data else "無近期重大新聞"
+    except Exception as e:
+        return f"新聞抓取失敗: {str(e)}"
+
+# 4.2 股價抓取 (使用 yfinance 但不依賴 session，避免過度複雜)
 @st.cache_data(ttl=300)
 def get_stock_price_history(symbol, days):
     end = datetime.now() + timedelta(days=1) 
     start = end - timedelta(days=days + 100)
     try:
+        # yfinance 的 download 在新版中比較穩定
         df = yf.download(symbol, start=start, end=end, progress=False)
+        
+        # 修正 MultiIndex 問題 (這是很多錯誤的根源)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        if df.empty: return None, "Empty"
+            
+        if df.empty: return None, "Empty Data"
         return df, None
     except Exception as e:
         return None, str(e)
 
-# 🆕 Google News 抓取函數
-def fetch_google_news(query_name):
-    try:
-        # 設定 Google News: 繁體中文, 台灣, 過去 7 天
-        google_news = GNews(language='zh-Hant', country='TW', period='7d', max_results=5)
-        news_json = google_news.get_news(query_name)
-        
-        news_data = []
-        for n in news_json:
-            # 格式化新聞標題與來源
-            title = n.get('title', '無標題')
-            publisher = n.get('publisher', {}).get('title', 'Google News')
-            url = n.get('url', '#')
-            # 存成 Markdown 連結格式
-            news_data.append(f"- [{title}]({url}) ({publisher})")
-            
-        return "\n".join(news_data) if news_data else "無近期重大新聞"
-    except Exception as e:
-        return f"新聞抓取失敗: {str(e)}"
-
+# 4.3 基本面抓取 (高容錯模式)
 @st.cache_data(ttl=43200)
 def get_stock_fundamentals(symbol):
+    info = {}
+    financials = pd.DataFrame()
+    stock_name = symbol # 預設名稱為代碼
+    
     try:
-        session = get_session()
+        # 使用 Session 偽裝
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'})
+        
         stock = yf.Ticker(symbol, session=session)
         
-        # 1. 抓基本面
-        try: info = stock.info
-        except: info = {}
+        # 嘗試抓 info
+        try:
+            info = stock.info
+            if 'longName' in info:
+                stock_name = info['longName'].replace("Inc.", "").replace("Co., Ltd.", "").strip()
+        except:
+            pass # 抓不到 info 也不要當機
             
-        try: financials = stock.financials
-        except: financials = pd.DataFrame()
+        # 嘗試抓 financials
+        try:
+            financials = stock.financials
+        except:
+            pass
 
-        # 2. 確定公司名稱 (用於搜新聞)
-        stock_name = symbol
-        if 'longName' in info:
-            stock_name = info['longName']
-            # 清理名稱，移除 "Inc." 或 "Co., Ltd." 以增加搜尋準確度
-            stock_name = stock_name.replace("Inc.", "").replace("Co., Ltd.", "").strip()
-            # 如果是台股，通常 longName 會是英文 (如 TSMC)，我們可以試著保留，或直接用代碼搜
-        
-        # 3. 🆕 改用 Google News 搜尋
-        # 優先搜尋中文名稱，如果沒有，Yahoo 的 longName 通常是英文
-        # 這裡我們做一個小技巧：如果代碼是數字(台股)，我們加上 "股票" 兩字來搜，準確度更高
-        search_query = stock_name
+        # 準備新聞搜尋關鍵字
+        search_key = stock_name
         if symbol.replace(".TW", "").replace(".TWO", "").isdigit():
-             # 台股直接用 info 裡的中文名(如果有) 或者乾脆用代碼
-             # 由於 Yahoo info 常常給英文名，我們這裡做個備案：
-             # 如果是台股，直接搜 "股票代號" + "新聞"，例如 "2330 新聞"
              base_code = symbol.split(".")[0]
-             search_query = f"{base_code} {stock_name}"
+             # 台股策略：代碼 + 名稱 (例如 "2330 台積電") 準確度最高
+             search_key = f"{base_code} {stock_name}" if stock_name != symbol else f"{base_code} 股票"
 
-        news_text = fetch_google_news(search_query)
+        news_text = fetch_google_news(search_key)
             
         return info, financials, stock_name, news_text
     except Exception as e:
-        return {}, pd.DataFrame(), symbol, "基本面抓取失敗"
+        # 最慘的情況，回傳預設值，讓程式繼續跑
+        return {}, pd.DataFrame(), symbol, "無法取得新聞"
 
-# --- 5. 智慧基本面修復函數 ---
+# --- 5. 智慧數值處理 (處理 N/A) ---
 def get_smart_fundamentals(info, financials, current_price):
+    # 預設值
+    pe_str, roe_str, eps_val, peg_str, rev_str = "N/A", "N/A", None, "N/A", "N/A"
+    
+    # 1. 嘗試讀取 PE/EPS
     pe = info.get('trailingPE') or info.get('forwardPE')
     eps = info.get('trailingEps') or info.get('forwardEps')
-    rev_growth = info.get('revenueGrowth')
     
-    manual_pe_val = None
-    
-    if pe is not None:
+    if pe: 
         pe_str = f"{pe:.2f}"
-        manual_pe_val = pe
-    elif eps is not None:
-        if eps > 0:
-            manual_pe_val = current_price / eps
-            pe_str = f"{manual_pe_val:.2f} (估)"
-        else:
-            pe_str = "虧損 (EPS<0)"
-    else:
-        pe_str = "N/A"
-
-    roe = info.get('returnOnEquity')
-    if roe is not None:
-        roe_str = f"{roe*100:.2f}%"
-    else:
-        roe_str = "N/A"
-    
-    if rev_growth is not None:
-        rev_str = f"{rev_growth*100:.2f}%"
-    else:
-        rev_str = "N/A"
+    elif eps and eps > 0:
+        pe_str = f"{current_price/eps:.2f} (估)"
+    elif eps and eps <= 0:
+        pe_str = "虧損"
         
-    peg = info.get('pegRatio')
-    if peg is not None:
-        peg_str = f"{peg:.2f}"
+    if eps: eps_val = eps
+
+    # 2. ROE
+    if info.get('returnOnEquity'):
+        roe_str = f"{info['returnOnEquity']*100:.2f}%"
+
+    # 3. 營收成長
+    if info.get('revenueGrowth'):
+        rev_str = f"{info['revenueGrowth']*100:.2f}%"
+
+    # 4. PEG 計算
+    if info.get('pegRatio'):
+        peg_str = f"{info['pegRatio']:.2f}"
     else:
+        # 手動算
         try:
-            eps_row = None
             if not financials.empty:
-                for idx in financials.index:
-                    if 'Basic EPS' in str(idx) or 'Diluted EPS' in str(idx):
-                        eps_row = financials.loc[idx]
-                        break
-            
-            if eps_row is not None and len(eps_row) >= 2:
-                eps_this_year = eps_row.iloc[0]
-                eps_last_year = eps_row.iloc[1]
-                
-                if eps_last_year != 0:
-                    growth_rate = ((eps_this_year - eps_last_year) / abs(eps_last_year)) * 100
-                    if growth_rate > 0 and manual_pe_val is not None:
-                        calc_peg = manual_pe_val / growth_rate
-                        peg_str = f"{calc_peg:.2f} (估)"
-                    elif growth_rate <= 0:
-                        peg_str = "N/A (EPS衰退)"
-                    else:
-                        peg_str = "N/A"
-                else:
-                    peg_str = "N/A"
-            else:
-                peg_str = "N/A"
-        except Exception as e:
-            peg_str = "N/A"
-        
-    return pe_str, roe_str, eps, peg_str, rev_str
+                # 模糊搜尋 EPS 列
+                eps_row = financials[financials.index.str.contains('EPS', case=False, na=False)]
+                if not eps_row.empty and len(eps_row.columns) >= 2:
+                    e_now = eps_row.iloc[0, 0]
+                    e_prev = eps_row.iloc[0, 1]
+                    if e_prev != 0:
+                        g = (e_now - e_prev) / abs(e_prev)
+                        if g > 0 and pe:
+                            peg_str = f"{pe/ (g*100):.2f} (估)"
+        except:
+            pass
 
-# --- 6. AI 分析函數 ---
-def get_prompt(symbol, stock_name, pe, roe, peg, rev_growth, recent_data, news_text):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return pe_str, roe_str, eps_val, peg_str, rev_str
+
+# --- 6. AI 分析 (容錯版 Prompt) ---
+def get_prompt(symbol, stock_name, pe, roe, peg, rev, recent_data, news_text):
+    now_str = datetime.now().strftime("%Y-%m-%d")
     
     return f"""
-    角色設定：你是一位擁有 20 年經驗的華爾街「首席投資長 (CIO)」。
-    現在時間是 {now_str}。
-    
-    分析標的：**{stock_name}** (股票代號：{symbol})
-    ⚠️ **重要指令**：
-    1. 針對 "{stock_name}" 進行分析。
-    2. 若基本面數據為 "N/A"，請忽略該指標，改以技術面與新聞面為主。
-    
-    【📰 Google News 精選頭條】
+    角色：華爾街首席分析師。時間：{now_str}。
+    標的：**{stock_name} ({symbol})**。
+
+    【📰 新聞情報】
     {news_text}
     
-    【📊 財務體質 (若為 N/A 請依據知識庫分析)】
-    - PE: {pe}
-    - ROE: {roe}
-    - PEG: {peg}
-    - 營收成長: {rev_growth}
+    【📊 基本面數據】(若為 N/A 代表資料暫缺，請改用你的知識庫分析)
+    - PE: {pe}, ROE: {roe}, PEG: {peg}, 營收成長: {rev}
 
-    【📈 近五日技術數據 (絕對準確)】
+    【📈 技術數據 (近5日)】
     {recent_data}
 
-    請撰寫一份【全方位深度投資報告】，章節如下：
-
-    ### 1. 📰 新聞情緒與事件解讀
-    - 根據上述新聞標題，判斷目前市場對該股是「樂觀」還是「悲觀」？
-    - 有無重大事件（如財報公佈、新產品、除權息）？
-
-    ### 2. 🕵️‍♂️ 盤勢與籌碼 (Context)
-    - 解讀 K 線型態、OBV 與 MACD。
-
-    ### 3. 🏢 估值與基本面檢視
-    - 若有 PEG，請分析是否低估。
-    - 若無數據，請簡述該公司產業地位。
-
-    ### 4. ⚔️ 劇本推演 (Scenarios)
-    - **多頭劇本**：關鍵突破價。
-    - **回檔劇本**：關鍵支撐價。
-
-    ### 5. 🎯 操作策略 (Action)
-    - **建議**：(買進/觀望/賣出)
-    - **綜合評分 (0-100)**。
+    請撰寫【全方位投資報告】：
+    1. **新聞解讀**：市場情緒是樂觀/悲觀？有什麼大事？
+    2. **基本面診斷**：若有數據請分析估值；**若無數據(N/A)，請憑知識簡述該公司產業地位與護城河**。
+    3. **技術面判讀**：解讀趨勢、OBV、MACD。
+    4. **操作建議**：多空劇本與進出場點位。
     """
 
-def call_gemini(prompt):
+def call_ai(model_name, prompt):
     try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
+        if model_name == 'gemini' and gemini_ok:
+            return gemini_model.generate_content(prompt).text
+        elif model_name == 'groq' and groq_ok:
+            return groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.3-70b-versatile"
+            ).choices[0].message.content
     except Exception as e:
-        if "404" in str(e): return f"⚠️ 模型錯誤: {e}"
-        if "429" in str(e): return "⚠️ Gemini 休息中 (免費額度暫時用完)，請過 1 分鐘後再試。"
-        return f"Gemini 思考失敗: {e}"
-
-def call_groq(prompt):
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
-        )
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        return f"Groq 失敗: {e}"
+        return f"AI 思考中斷: {str(e)}"
+    return "API Key 未設定"
 
 # --- 7. 主程式 ---
 if run_btn and ticker_input:
@@ -297,108 +250,72 @@ if run_btn and ticker_input:
     
     final_symbol = raw_symbol
     df_raw = None
-    error_msg = ""
     
-    with st.spinner(f"正在搜尋 {raw_symbol} 並進行全方位掃描 (Google News 啟動)..."):
+    with st.spinner(f"正在搜尋 {raw_symbol}..."):
+        # 智慧搜尋上市/上櫃
         if raw_symbol.isdigit():
-            # 1. 嘗試上市 (.TW)
-            try_tw = raw_symbol + ".TW"
-            df_test, err = get_stock_price_history(try_tw, days_input)
-            
-            if df_test is not None and not df_test.empty:
-                final_symbol = try_tw
-                df_raw = df_test
-            else:
-                # 2. 嘗試上櫃 (.TWO)
-                try_two = raw_symbol + ".TWO"
-                df_test, err = get_stock_price_history(try_two, days_input)
+            for suffix in [".TW", ".TWO"]:
+                test_sym = raw_symbol + suffix
+                df_test, _ = get_stock_price_history(test_sym, days_input)
                 if df_test is not None and not df_test.empty:
-                    final_symbol = try_two
+                    final_symbol = test_sym
                     df_raw = df_test
-                else:
-                    error_msg = "上市(.TW)與上櫃(.TWO)皆查無資料"
+                    break
         else:
-            final_symbol = raw_symbol
-            df_raw, error_msg = get_stock_price_history(final_symbol, days_input)
+            df_raw, _ = get_stock_price_history(final_symbol, days_input)
 
     if df_raw is None or df_raw.empty:
-        st.error(f"❌ 找不到 {raw_symbol} 的資料。{error_msg}")
+        st.error(f"❌ 查無 {raw_symbol} 資料。請稍後再試或檢查代碼。")
     else:
+        # 取得基本面 (即使失敗也不會當機)
         info, financials, stock_name, news_text = get_stock_fundamentals(final_symbol)
         
+        # 指標運算
         df = calculate_indicators(df_raw).iloc[-days_input:]
         last = df.iloc[-1]
         chg = last['Close'] - df['Close'].iloc[-2]
         pct = (chg / df['Close'].iloc[-2]) * 100
         
-        pe_str, roe_str, eps_val, peg_str, rev_str = get_smart_fundamentals(info, financials, last['Close'])
-        last_date = last.name.strftime('%Y-%m-%d')
+        # 數值格式化
+        pe, roe, eps, peg, rev = get_smart_fundamentals(info, financials, last['Close'])
         
-        st.header(f"🔥 {stock_name} ({final_symbol}) 即時戰情室")
+        st.header(f"🔥 {stock_name} ({final_symbol}) 戰情室")
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
-        c2.metric("營收成長(YOY)", rev_str)
-        c3.metric("PE", pe_str)
-        c4.metric("ROE", roe_str)
-        c5.metric("EPS", f"{eps_val:.2f}" if eps_val else "N/A")
-        c6.metric("PEG", peg_str)
+        # 顯示看板 (容錯處理: 沒資料顯示 N/A)
+        cols = st.columns(6)
+        cols[0].metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
+        cols[1].metric("營收成長", rev)
+        cols[2].metric("PE", pe)
+        cols[3].metric("ROE", roe)
+        cols[4].metric("EPS", f"{eps:.2f}" if eps else "N/A")
+        cols[5].metric("PEG", peg)
 
-        tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 全方位報告", "🏢 財報數據"])
+        tab1, tab2, tab3 = st.tabs(["📊 線圖", "⚡ AI 報告", "📰 新聞"])
 
         with tab1:
-            rows = 2
-            if show_macd: rows += 1
-            if show_obv: rows += 1
-            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=[0.5] + [0.15]*(rows-1))
-            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
             fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
-            if show_ma:
-                fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='月線'), row=1, col=1)
-            
-            curr_row = 2
-            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='量'), row=curr_row, col=1); curr_row+=1
-            
-            if show_macd:
-                colors = ['red' if h > 0 else 'green' for h in df['MACD_Hist']]
-                fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors, name='MACD'), row=curr_row, col=1); curr_row+=1
-            if show_obv:
-                fig.add_trace(go.Scatter(x=df.index, y=df['OBV'], line=dict(color='purple'), name='OBV', fill='tozeroy'), row=curr_row, col=1)
-                
-            fig.update_layout(height=800, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10))
+            if show_ma: fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='MA20'), row=1, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='量'), row=2, col=1)
+            fig.update_layout(height=600, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
         with tab2:
-            st.subheader(f"⚡ {stock_name} 投資論戰")
-            
-            with st.expander("📰 點擊查看原始 Google News 頭條"):
-                st.markdown(news_text)
-
             data_str = df.tail(5).to_string()
+            # 確保變數正確傳入
+            prompt = get_prompt(final_symbol, stock_name, pe, roe, peg, rev, data_str, news_text)
             
-            prompt = get_prompt(final_symbol, stock_name, pe_str, roe_str, peg_str, rev_str, data_str, news_text)
-            
-            col_gemini, col_groq = st.columns(2)
-            with col_gemini:
-                st.markdown("### 🔵 Gemini (Google)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("### 🔵 Gemini")
                 if gemini_ok:
-                    with st.spinner("Gemini 正在解讀新聞與財報..."):
-                        res_g = call_gemini(prompt)
-                        st.info(res_g)
-                else:
-                    st.error("請設定 GEMINI_API_KEY")
-
-            with col_groq:
-                st.markdown("### 🟠 Llama 3.3 (Meta)")
+                    st.info(call_ai('gemini', prompt))
+                else: st.error("無 Gemini Key")
+            with c2:
+                st.markdown("### 🟠 Llama 3")
                 if groq_ok:
-                    with st.spinner("Llama 3.3 正在分析市場情緒..."):
-                        res_l = call_groq(prompt)
-                        st.warning(res_l) 
-                else:
-                    st.error("請設定 GROQ_API_KEY")
+                    st.warning(call_ai('groq', prompt))
+                else: st.error("無 Groq Key")
 
         with tab3:
-            if not financials.empty:
-                st.dataframe(financials)
-            else:
-                st.warning("無財報資料")
+            st.markdown(news_text)
