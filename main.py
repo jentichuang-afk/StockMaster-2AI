@@ -234,4 +234,132 @@ def call_gemini(prompt):
         response = gemini_model.generate_content(prompt)
         return response.text
     except Exception as e:
-        if "4
+        if "404" in str(e):
+            return f"⚠️ 模型錯誤: {e}"
+        if "429" in str(e):
+            return "⚠️ Gemini 休息中 (免費額度暫時用完)，請過 1 分鐘後再試。"
+        return f"Gemini 思考失敗: {e}"
+
+def call_groq(prompt):
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        return f"Groq 失敗: {e}"
+
+# --- 7. 主程式 ---
+if run_btn and ticker_input:
+    raw_symbol = ticker_input.strip().upper()
+    
+    final_symbol = raw_symbol
+    df_raw = None
+    error_msg = ""
+    
+    with st.spinner(f"正在搜尋 {raw_symbol} 並進行全方位掃描..."):
+        if raw_symbol.isdigit():
+            try_tw = raw_symbol + ".TW"
+            df_test, err = get_stock_price_history(try_tw, days_input)
+            
+            if df_test is not None and not df_test.empty:
+                final_symbol = try_tw
+                df_raw = df_test
+            else:
+                try_two = raw_symbol + ".TWO"
+                df_test, err = get_stock_price_history(try_two, days_input)
+                if df_test is not None and not df_test.empty:
+                    final_symbol = try_two
+                    df_raw = df_test
+                else:
+                    error_msg = "上市(.TW)與上櫃(.TWO)皆查無資料"
+        else:
+            final_symbol = raw_symbol
+            df_raw, error_msg = get_stock_price_history(final_symbol, days_input)
+
+    if df_raw is None or df_raw.empty:
+        st.error(f"❌ 找不到 {raw_symbol} 的資料。請確認代碼是否正確。")
+    else:
+        # 🆕 info 中現在包含 news_text
+        info, financials, stock_name, news_text = get_stock_fundamentals(final_symbol)
+        
+        df = calculate_indicators(df_raw).iloc[-days_input:]
+        last = df.iloc[-1]
+        chg = last['Close'] - df['Close'].iloc[-2]
+        pct = (chg / df['Close'].iloc[-2]) * 100
+        
+        # 🆕 新增營收成長率
+        pe_str, roe_str, eps_val, peg_str, rev_str = get_smart_fundamentals(info, financials, last['Close'])
+        last_date = last.name.strftime('%Y-%m-%d')
+        
+        st.header(f"🔥 {stock_name} ({final_symbol}) 即時戰情室")
+
+        # 顯示 6 大指標 (新增營收成長)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("股價", f"{last['Close']:.2f}", f"{pct:.2f}%")
+        c2.metric("營收成長(YOY)", rev_str) # 🆕 換成營收成長
+        c3.metric("PE", pe_str)
+        c4.metric("ROE", roe_str)
+        c5.metric("EPS", f"{eps_val:.2f}" if eps_val else "N/A")
+        c6.metric("PEG", peg_str)
+
+        tab1, tab2, tab3 = st.tabs(["📊 技術圖表", "⚡ 雙 AI 全方位報告", "🏢 財報數據"])
+
+        with tab1:
+            rows = 2
+            if show_macd: rows += 1
+            if show_obv: rows += 1
+            fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=[0.5] + [0.15]*(rows-1))
+            
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
+            if show_ma:
+                fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='orange'), name='月線'), row=1, col=1)
+            
+            curr_row = 2
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='量'), row=curr_row, col=1); curr_row+=1
+            
+            if show_macd:
+                colors = ['red' if h > 0 else 'green' for h in df['MACD_Hist']]
+                fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], marker_color=colors, name='MACD'), row=curr_row, col=1); curr_row+=1
+            if show_obv:
+                fig.add_trace(go.Scatter(x=df.index, y=df['OBV'], line=dict(color='purple'), name='OBV', fill='tozeroy'), row=curr_row, col=1)
+                
+            fig.update_layout(height=800, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with tab2:
+            st.subheader(f"⚡ {stock_name} 投資論戰")
+            
+            # 顯示原始新聞標題 (摺疊)
+            with st.expander("📰 點擊查看原始新聞頭條"):
+                st.markdown(news_text)
+
+            data_str = df.tail(5).to_string()
+            # 🆕 傳入新聞與營收數據給 AI
+            prompt = get_prompt(symbol, stock_name, pe_str, roe_str, peg_str, rev_str, data_str, news_text)
+            
+            col_gemini, col_groq = st.columns(2)
+            with col_gemini:
+                st.markdown("### 🔵 Gemini (Google)")
+                if gemini_ok:
+                    with st.spinner("Gemini 正在解讀新聞與財報..."):
+                        res_g = call_gemini(prompt)
+                        st.info(res_g)
+                else:
+                    st.error("請設定 GEMINI_API_KEY")
+
+            with col_groq:
+                st.markdown("### 🟠 Llama 3.3 (Meta)")
+                if groq_ok:
+                    with st.spinner("Llama 3.3 正在分析市場情緒..."):
+                        res_l = call_groq(prompt)
+                        st.warning(res_l) 
+                else:
+                    st.error("請設定 GROQ_API_KEY")
+
+        with tab3:
+            if not financials.empty:
+                st.dataframe(financials)
+            else:
+                st.warning("無財報資料")
